@@ -32,6 +32,10 @@ func getFriendList(bot *coolq.CQBot, _ resultGetter) coolq.MSG {
 	return bot.CQGetFriendList()
 }
 
+func deleteFriend(bot *coolq.CQBot, p resultGetter) coolq.MSG {
+	return bot.CQDeleteFriend(p.Get("id").Int())
+}
+
 func getGroupList(bot *coolq.CQBot, p resultGetter) coolq.MSG {
 	return bot.CQGetGroupList(p.Get("no_cache").Bool())
 }
@@ -267,7 +271,7 @@ func deleteGroupFolder(bot *coolq.CQBot, p resultGetter) coolq.MSG {
 }
 
 func deleteGroupFile(bot *coolq.CQBot, p resultGetter) coolq.MSG {
-	return bot.CQGroupFileDeleteFile(p.Get("group_id").Int(), p.Get("folder_id").Str, p.Get("file_id").Str, int32(p.Get("bus_id").Int()))
+	return bot.CQGroupFileDeleteFile(p.Get("group_id").Int(), p.Get("file_id").Str, int32(p.Get("bus_id").Int()))
 }
 
 func getGroupMsgHistory(bot *coolq.CQBot, p resultGetter) coolq.MSG {
@@ -346,10 +350,15 @@ func setModelShow(bot *coolq.CQBot, p resultGetter) coolq.MSG {
 	return bot.CQSetModelShow(p.Get("model").String(), p.Get("model_show").String())
 }
 
+func markMSGAsRead(bot *coolq.CQBot, p resultGetter) coolq.MSG {
+	return bot.CQMarkMessageAsRead(int32(p.Get("message_id").Int()))
+}
+
 // API 是go-cqhttp当前支持的所有api的映射表
 var API = map[string]func(*coolq.CQBot, resultGetter) coolq.MSG{
 	"get_login_info":             getLoginInfo,
 	"get_friend_list":            getFriendList,
+	"delete_friend":              deleteFriend,
 	"get_group_list":             getGroupList,
 	"get_group_info":             getGroupInfo,
 	"get_group_member_list":      getGroupMemberList,
@@ -408,6 +417,7 @@ var API = map[string]func(*coolq.CQBot, resultGetter) coolq.MSG{
 	"qidian_get_account_info":    getQiDianAccountInfo,
 	"_get_model_show":            getModelShow,
 	"_set_model_show":            setModelShow,
+	"mark_msg_as_read":           markMSGAsRead,
 }
 
 func (api *apiCaller) callAPI(action string, p resultGetter) coolq.MSG {

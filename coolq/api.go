@@ -3,8 +3,8 @@ package coolq
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"os"
 	"path"
@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/Mrs4s/MiraiGo/binary"
 	"github.com/Mrs4s/MiraiGo/client"
@@ -71,6 +70,20 @@ func (bot *CQBot) CQGetFriendList() MSG {
 		})
 	}
 	return OK(fs)
+}
+
+// CQDeleteFriend 删除好友
+//
+//
+func (bot *CQBot) CQDeleteFriend(uin int64) MSG {
+	if bot.Client.FindFriend(uin) == nil {
+		return Failed(100, "FRIEND_NOT_FOUND", "好友不存在")
+	}
+	if err := bot.Client.DeleteFriend(uin); err != nil {
+		log.Errorf("删除好友时出现错误: %v", err)
+		return Failed(100, "DELETE_API_ERROR", err.Error())
+	}
+	return OK(nil)
 }
 
 // CQGetGroupList 获取群列表
@@ -307,13 +320,13 @@ func (bot *CQBot) CQGroupFileDeleteFolder(groupID int64, id string) MSG {
 // CQGroupFileDeleteFile 拓展API-删除群文件
 //
 //
-func (bot *CQBot) CQGroupFileDeleteFile(groupID int64, parentID, id string, busID int32) MSG {
+func (bot *CQBot) CQGroupFileDeleteFile(groupID int64, id string, busID int32) MSG {
 	fs, err := bot.Client.GetGroupFileSystem(groupID)
 	if err != nil {
 		log.Errorf("获取群 %v 文件系统信息失败: %v", groupID, err)
 		return Failed(100, "FILE_SYSTEM_API_ERROR", err.Error())
 	}
-	if res := fs.DeleteFile(parentID, id, busID); res != "" {
+	if res := fs.DeleteFile("", id, busID); res != "" {
 		log.Errorf("删除群 %v 文件 %v 时出现文件: %v", groupID, id, res)
 		return Failed(200, "FILE_SYSTEM_API_ERROR", res)
 	}
@@ -337,8 +350,7 @@ func (bot *CQBot) CQGetWordSlices(content string) MSG {
 // CQSendGroupMessage 发送群消息
 //
 // https://git.io/Jtz1c
-func (bot *CQBot) CQSendGroupMessage(groupID int64, i interface{}, autoEscape bool) MSG {
-	var str string
+func (bot *CQBot) CQSendGroupMessage(groupID int64, m gjson.Result, autoEscape bool) MSG {
 	group := bot.Client.FindGroup(groupID)
 	if group == nil {
 		return Failed(100, "GROUP_NOT_FOUND", "群聊不存在")
@@ -346,52 +358,37 @@ func (bot *CQBot) CQSendGroupMessage(groupID int64, i interface{}, autoEscape bo
 	fixAt := func(elem []message.IMessageElement) {
 		for _, e := range elem {
 			if at, ok := e.(*message.AtElement); ok && at.Target != 0 && at.Display == "" {
-				at.Display = "@" + func() string {
-					mem := group.FindMember(at.Target)
-					if mem != nil {
-						return mem.DisplayName()
-					}
-					return strconv.FormatInt(at.Target, 10)
-				}()
+				mem := group.FindMember(at.Target)
+				if mem != nil {
+					at.Display = "@" + mem.DisplayName()
+				} else {
+					at.Display = "@" + strconv.FormatInt(at.Target, 10)
+				}
 			}
 		}
 	}
-	if m, ok := i.(gjson.Result); ok {
-		if m.Type == gjson.JSON {
-			elem := bot.ConvertObjectMessage(m, true)
-			fixAt(elem)
-			mid := bot.SendGroupMessage(groupID, &message.SendingMessage{Elements: elem})
-			if mid == -1 {
-				return Failed(100, "SEND_MSG_API_ERROR", "请参考输出")
-			}
-			log.Infof("发送群 %v(%v) 的消息: %v (%v)", group.Name, groupID, limitedString(ToStringMessage(elem, int64(mid))), mid)
-			return OK(MSG{"message_id": mid})
-		}
-		str = func() string {
-			if m.Str != "" {
-				return m.Str
-			}
-			return m.Raw
-		}()
-	} else if s, ok := i.(string); ok {
-		str = s
-	}
-	if str == "" {
-		log.Warnf("群消息发送失败: 信息为空. MSG: %v", i)
-		return Failed(100, "EMPTY_MSG_ERROR", "消息为空")
-	}
+
 	var elem []message.IMessageElement
-	if autoEscape {
-		elem = append(elem, message.NewText(str))
+	if m.Type == gjson.JSON {
+		elem = bot.ConvertObjectMessage(m, true)
 	} else {
-		elem = bot.ConvertStringMessage(str, true)
+		str := m.String()
+		if str == "" {
+			log.Warn("群消息发送失败: 信息为空.")
+			return Failed(100, "EMPTY_MSG_ERROR", "消息为空")
+		}
+		if autoEscape {
+			elem = []message.IMessageElement{message.NewText(str)}
+		} else {
+			elem = bot.ConvertStringMessage(str, true)
+		}
 	}
 	fixAt(elem)
 	mid := bot.SendGroupMessage(groupID, &message.SendingMessage{Elements: elem})
 	if mid == -1 {
-		return Failed(100, "SEND_MSG_API_ERROR", "请参考输出")
+		return Failed(100, "SEND_MSG_API_ERROR", "请参考 go-cqhttp 端输出")
 	}
-	log.Infof("发送群 %v(%v) 的消息: %v (%v)", group.Name, groupID, limitedString(str), mid)
+	log.Infof("发送群 %v(%v) 的消息: %v (%v)", group.Name, groupID, limitedString(m.String()), mid)
 	return OK(MSG{"message_id": mid})
 }
 
@@ -402,28 +399,44 @@ func (bot *CQBot) CQSendGroupForwardMessage(groupID int64, m gjson.Result) MSG {
 	if m.Type != gjson.JSON {
 		return Failed(100)
 	}
-	var sendNodes []*message.ForwardNode
+	fm := message.NewForwardMessage()
 	ts := time.Now().Add(-time.Minute * 5)
-	hasCustom := func() bool {
-		for _, item := range m.Array() {
-			if item.Get("data.uin").Exists() {
-				return true
+	hasCustom := false
+	m.ForEach(func(_, item gjson.Result) bool {
+		if item.Get("data.uin").Exists() || item.Get("data.user_id").Exists() {
+			hasCustom = true
+			return false
+		}
+		return true
+	})
+
+	resolveElement := func(elems []message.IMessageElement) []message.IMessageElement {
+		for i, elem := range elems {
+			switch elem.(type) {
+			case *LocalImageElement, *LocalVideoElement:
+				gm, err := bot.uploadMedia(elem, groupID, true)
+				if err != nil {
+					log.Warnf("警告: 群 %d %s上传失败: %v", groupID, elem.Type().String(), err)
+					continue
+				}
+				elems[i] = gm
 			}
 		}
-		return false
-	}()
-	var convert func(e gjson.Result) []*message.ForwardNode
-	convert = func(e gjson.Result) (nodes []*message.ForwardNode) {
+		return elems
+	}
+
+	var convert func(e gjson.Result) *message.ForwardNode
+	convert = func(e gjson.Result) *message.ForwardNode {
 		if e.Get("type").Str != "node" {
 			return nil
 		}
 		ts.Add(time.Second)
 		if e.Get("data.id").Exists() {
-			i, _ := strconv.Atoi(e.Get("data.id").String())
+			i := e.Get("data.id").Int()
 			m := bot.GetMessage(int32(i))
 			if m != nil {
 				sender := m["sender"].(message.Sender)
-				nodes = append(nodes, &message.ForwardNode{
+				return &message.ForwardNode{
 					SenderId:   sender.Uin,
 					SenderName: (&sender).DisplayName(),
 					Time: func() int32 {
@@ -433,136 +446,107 @@ func (bot *CQBot) CQSendGroupForwardMessage(groupID int64, m gjson.Result) MSG {
 						}
 						return msgTime
 					}(),
-					Message: bot.ConvertStringMessage(m["message"].(string), true),
-				})
-				return
+					Message: resolveElement(bot.ConvertStringMessage(m["message"].(string), true)),
+				}
 			}
 			log.Warnf("警告: 引用消息 %v 错误或数据库未开启.", e.Get("data.id").Str)
-			return
+			return nil
 		}
-		uin, _ := strconv.ParseInt(e.Get("data.uin").Str, 10, 64)
-		msgTime, err := strconv.ParseInt(e.Get("data.time").Str, 10, 64)
-		if err != nil {
+		uin := e.Get("data.[user_id,uin].0").Int()
+		msgTime := e.Get("data.time").Int()
+		if msgTime == 0 {
 			msgTime = ts.Unix()
 		}
 		name := e.Get("data.name").Str
 		c := e.Get("data.content")
 		if c.IsArray() {
-			flag := false
+			nested := false
 			c.ForEach(func(_, value gjson.Result) bool {
-				if value.Get("type").String() == "node" {
-					flag = true
+				if value.Get("type").Str == "node" {
+					nested = true
 					return false
 				}
 				return true
 			})
-			if flag {
-				var taowa []*message.ForwardNode
+			if nested { // 处理嵌套
+				nest := message.NewForwardMessage()
 				for _, item := range c.Array() {
-					taowa = append(taowa, convert(item)...)
+					node := convert(item)
+					if node != nil {
+						nest.AddNode(node)
+					}
 				}
-				nodes = append(nodes, &message.ForwardNode{
+				elem := bot.Client.UploadGroupForwardMessage(groupID, nest)
+				return &message.ForwardNode{
 					SenderId:   uin,
 					SenderName: name,
 					Time:       int32(msgTime),
-					Message:    []message.IMessageElement{bot.Client.UploadGroupForwardMessage(groupID, &message.ForwardMessage{Nodes: taowa})},
-				})
-				return
+					Message:    []message.IMessageElement{elem},
+				}
 			}
 		}
 		content := bot.ConvertObjectMessage(e.Get("data.content"), true)
 		if uin != 0 && name != "" && len(content) > 0 {
-			var newElem []message.IMessageElement
-			for _, elem := range content {
-				if img, ok := elem.(*LocalImageElement); ok {
-					gm, err := bot.UploadLocalImageAsGroup(groupID, img)
-					if err != nil {
-						log.Warnf("警告：群 %v 图片上传失败: %v", groupID, err)
-						continue
-					}
-					newElem = append(newElem, gm)
-					continue
-				}
-				if video, ok := elem.(*LocalVideoElement); ok {
-					gm, err := bot.UploadLocalVideo(groupID, video)
-					if err != nil {
-						log.Warnf("警告：群 %v 视频上传失败: %v", groupID, err)
-						continue
-					}
-					newElem = append(newElem, gm)
-					continue
-				}
-				newElem = append(newElem, elem)
-			}
-			nodes = append(nodes, &message.ForwardNode{
+			return &message.ForwardNode{
 				SenderId:   uin,
 				SenderName: name,
 				Time:       int32(msgTime),
-				Message:    newElem,
-			})
-			return
+				Message:    resolveElement(content),
+			}
 		}
-		log.Warnf("警告: 非法 Forward node 将跳过")
-		return
+		log.Warnf("警告: 非法 Forward node 将跳过. uin: %v name: %v content count: %v", uin, name, len(content))
+		return nil
 	}
 	if m.IsArray() {
 		for _, item := range m.Array() {
-			sendNodes = append(sendNodes, convert(item)...)
+			node := convert(item)
+			if node != nil {
+				fm.AddNode(node)
+			}
 		}
 	} else {
-		sendNodes = convert(m)
+		node := convert(m)
+		if node != nil {
+			fm.AddNode(node)
+		}
 	}
-	if len(sendNodes) > 0 {
-		ret := bot.Client.SendGroupForwardMessage(groupID, &message.ForwardMessage{Nodes: sendNodes})
+	if fm.Length() > 0 {
+		fe := bot.Client.UploadGroupForwardMessage(groupID, fm)
+		ret := bot.Client.SendGroupForwardMessage(groupID, fe)
 		if ret == nil || ret.Id == -1 {
 			log.Warnf("合并转发(群)消息发送失败: 账号可能被风控.")
-			return Failed(100, "SEND_MSG_API_ERROR", "请参考输出")
+			return Failed(100, "SEND_MSG_API_ERROR", "请参考 go-cqhttp 端输出")
 		}
 		return OK(MSG{
 			"message_id": bot.InsertGroupMessage(ret),
 		})
 	}
-	return Failed(100)
+	return Failed(100, "EMPTY_NODES", "未找到任何可发送的合并转发信息")
 }
 
 // CQSendPrivateMessage 发送私聊消息
 //
 // https://git.io/Jtz1l
-func (bot *CQBot) CQSendPrivateMessage(userID int64, groupID int64, i interface{}, autoEscape bool) MSG {
-	var str string
-	if m, ok := i.(gjson.Result); ok {
-		if m.Type == gjson.JSON {
-			elem := bot.ConvertObjectMessage(m, false)
-			mid := bot.SendPrivateMessage(userID, groupID, &message.SendingMessage{Elements: elem})
-			if mid == -1 {
-				return Failed(100, "SEND_MSG_API_ERROR", "请参考输出")
-			}
-			log.Infof("发送好友 %v(%v)  的消息: %v (%v)", userID, userID, limitedString(m.String()), mid)
-			return OK(MSG{"message_id": mid})
-		}
-		str = func() string {
-			if m.Str != "" {
-				return m.Str
-			}
-			return m.Raw
-		}()
-	} else if s, ok := i.(string); ok {
-		str = s
-	}
-	if str == "" {
-		return Failed(100, "EMPTY_MSG_ERROR", "消息为空")
-	}
+func (bot *CQBot) CQSendPrivateMessage(userID int64, groupID int64, m gjson.Result, autoEscape bool) MSG {
 	var elem []message.IMessageElement
-	if autoEscape {
-		elem = append(elem, message.NewText(str))
+	if m.Type == gjson.JSON {
+		elem = bot.ConvertObjectMessage(m, false)
 	} else {
-		elem = bot.ConvertStringMessage(str, false)
+		str := m.String()
+		if str == "" {
+			return Failed(100, "EMPTY_MSG_ERROR", "消息为空")
+		}
+		if autoEscape {
+			elem = []message.IMessageElement{message.NewText(str)}
+		} else {
+			elem = bot.ConvertStringMessage(str, false)
+		}
 	}
 	mid := bot.SendPrivateMessage(userID, groupID, &message.SendingMessage{Elements: elem})
 	if mid == -1 {
-		return Failed(100, "SEND_MSG_API_ERROR", "请参考输出")
+		return Failed(100, "SEND_MSG_API_ERROR", "请参考 go-cqhttp 端输出")
 	}
-	log.Infof("发送好友 %v(%v)  的消息: %v (%v)", userID, userID, limitedString(str), mid)
+	log.Infof("发送好友 %v(%v)  的消息: %v (%v)", userID, userID, limitedString(m.String()), mid)
 	return OK(MSG{"message_id": mid})
 }
 
@@ -946,7 +930,7 @@ func (bot *CQBot) CQHandleQuickOperation(context, operation gjson.Result) MSG {
 					},
 				})
 
-				err := json.UnmarshalFromString(reply.Raw, &replySegments)
+				err := json.Unmarshal(utils.S2B(reply.Raw), &replySegments)
 				if err != nil {
 					log.WithError(err).Warnf("处理 at_sender 过程中发生错误")
 					return Failed(-1, "处理 at_sender 过程中发生错误", err.Error())
@@ -954,13 +938,13 @@ func (bot *CQBot) CQHandleQuickOperation(context, operation gjson.Result) MSG {
 
 				segments = append(segments, replySegments...)
 
-				modified, err := json.MarshalToString(segments)
+				modified, err := json.Marshal(segments)
 				if err != nil {
 					log.WithError(err).Warnf("处理 at_sender 过程中发生错误")
 					return Failed(-1, "处理 at_sender 过程中发生错误", err.Error())
 				}
 
-				reply = gjson.Parse(modified)
+				reply = gjson.Parse(utils.B2S(modified))
 			} else if at && reply.Type == gjson.String {
 				reply = gjson.Parse(fmt.Sprintf(
 					"\"[CQ:at,qq=%d]%s\"",
@@ -998,10 +982,10 @@ func (bot *CQBot) CQHandleQuickOperation(context, operation gjson.Result) MSG {
 		reqType := context.Get("request_type").Str
 		if operation.Get("approve").Exists() {
 			if reqType == "friend" {
-				bot.CQProcessFriendRequest(context.Get("flag").Str, operation.Get("approve").Bool())
+				bot.CQProcessFriendRequest(context.Get("flag").String(), operation.Get("approve").Bool())
 			}
 			if reqType == "group" {
-				bot.CQProcessGroupRequest(context.Get("flag").Str, context.Get("sub_type").Str, operation.Get("reason").Str, operation.Get("approve").Bool())
+				bot.CQProcessGroupRequest(context.Get("flag").String(), context.Get("sub_type").Str, operation.Get("reason").Str, operation.Get("approve").Bool())
 			}
 		}
 	}
@@ -1015,7 +999,7 @@ func (bot *CQBot) CQGetImage(file string) MSG {
 	if !global.PathExists(path.Join(global.ImagePath, file)) {
 		return Failed(100)
 	}
-	b, err := ioutil.ReadFile(path.Join(global.ImagePath, file))
+	b, err := os.ReadFile(path.Join(global.ImagePath, file))
 	if err == nil {
 		r := binary.NewReader(b)
 		r.ReadBytes(16)
@@ -1119,7 +1103,7 @@ func (bot *CQBot) CQGetMessage(messageID int32) MSG {
 			if isGroup {
 				return gid.(int64)
 			}
-			return sender.Uin
+			return 0
 		}(), false),
 	})
 }
@@ -1338,9 +1322,9 @@ func (bot *CQBot) CQGetEssenceMessageList(groupCode int64) MSG {
 			"sender_time":   m.SenderTime,
 			"operator_time": m.AddDigestTime,
 			"operator_nick": m.AddDigestNick,
+			"sender_id":     m.SenderUin,
+			"operator_id":   m.AddDigestUin,
 		}
-		msg["sender_id"], _ = strconv.ParseUint(m.SenderUin, 10, 64)
-		msg["operator_id"], _ = strconv.ParseUint(m.AddDigestUin, 10, 64)
 		msg["message_id"] = toGlobalID(groupCode, int32(m.MessageID))
 		list = append(list, msg)
 	}
@@ -1425,6 +1409,23 @@ func (bot *CQBot) CQSetModelShow(modelName string, modelShow string) MSG {
 	return OK(nil)
 }
 
+// CQMarkMessageAsRead 标记消息已读
+func (bot *CQBot) CQMarkMessageAsRead(msgID int32) MSG {
+	m := bot.GetMessage(msgID)
+	if m == nil {
+		return Failed(100, "MSG_NOT_FOUND", "消息不存在")
+	}
+	if _, ok := m["group"]; ok {
+		bot.Client.MarkGroupMessageReaded(m["group"].(int64), int64(m["message-id"].(int32)))
+		return OK(nil)
+	}
+	if _, ok := m["from-group"]; ok {
+		return Failed(100, "MSG_TYPE_ERROR", "不支持标记临时会话")
+	}
+	bot.Client.MarkPrivateMessageReaded(m["sender"].(message.Sender).Uin, int64(m["time"].(int32)))
+	return OK(nil)
+}
+
 // OK 生成成功返回值
 func OK(data interface{}) MSG {
 	return MSG{"data": data, "retcode": 0, "status": "ok"}
@@ -1458,11 +1459,12 @@ func convertGroupMemberInfo(groupID int64, m *client.GroupMemberInfo) MSG {
 			// unknown = 0xff
 			return "unknown"
 		}(),
-		"age":            0,
-		"area":           "",
-		"join_time":      m.JoinTime,
-		"last_sent_time": m.LastSpeakTime,
-		"level":          strconv.FormatInt(int64(m.Level), 10),
+		"age":               0,
+		"area":              "",
+		"join_time":         m.JoinTime,
+		"last_sent_time":    m.LastSpeakTime,
+		"shut_up_timestamp": m.ShutUpTimestamp,
+		"level":             strconv.FormatInt(int64(m.Level), 10),
 		"role": func() string {
 			switch m.Permission {
 			case client.Owner:
@@ -1483,15 +1485,17 @@ func convertGroupMemberInfo(groupID int64, m *client.GroupMemberInfo) MSG {
 }
 
 func limitedString(str string) string {
-	if utf8.RuneCountInString(str) <= 10 {
+	limited := [14]rune{10: ' ', 11: '.', 12: '.', 13: '.'}
+	i := 0
+	for _, r := range str {
+		if i >= 10 {
+			break
+		}
+		limited[i] = r
+		i++
+	}
+	if i != 10 {
 		return str
 	}
-	b := utils.S2B(str)
-	limited := make([]rune, 0, 10)
-	for i := 0; i < 10; i++ {
-		decodeRune, size := utf8.DecodeRune(b)
-		b = b[size:]
-		limited = append(limited, decodeRune)
-	}
-	return string(limited) + " ..."
+	return string(limited[:])
 }

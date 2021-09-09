@@ -2,6 +2,7 @@ package global
 
 import (
 	"math"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -10,18 +11,6 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
-
-var trueSet = map[string]struct{}{
-	"true": {},
-	"yes":  {},
-	"1":    {},
-}
-
-var falseSet = map[string]struct{}{
-	"false": {},
-	"no":    {},
-	"0":     {},
-}
 
 // EnsureBool 判断给定的p是否可表示为合法Bool类型,否则返回defaultVal
 //
@@ -41,27 +30,28 @@ func EnsureBool(p interface{}, defaultVal bool) bool {
 		if !j.Exists() {
 			return defaultVal
 		}
-		if j.Type == gjson.True {
+		switch j.Type { // nolint
+		case gjson.True:
 			return true
-		}
-		if j.Type == gjson.False {
+		case gjson.False:
 			return false
-		}
-		if j.Type != gjson.String {
+		case gjson.String:
+			str = j.Str
+		default:
 			return defaultVal
 		}
-		str = j.Str
 	} else if s, ok := p.(string); ok {
 		str = s
 	}
 	str = strings.ToLower(str)
-	if _, ok := trueSet[str]; ok {
+	switch str {
+	case "true", "yes", "1":
 		return true
-	}
-	if _, ok := falseSet[str]; ok {
+	case "false", "no", "0":
 		return false
+	default:
+		return defaultVal
 	}
-	return defaultVal
 }
 
 // VersionNameCompare 检查版本名是否需要更新, 仅适用于 go-cqhttp 的版本命名规则
@@ -97,6 +87,40 @@ func VersionNameCompare(current, remote string) bool {
 		return re[4] == "" && cur[4] != re[4]
 	}
 	return cur[4] < re[4]
+}
+
+// SetAtDefault 在变量 variable 为默认值 defaultValue 的时候修改为 value
+func SetAtDefault(variable, value, defaultValue interface{}) {
+	v := reflect.ValueOf(variable)
+	v2 := reflect.ValueOf(value)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return
+	}
+	v = v.Elem()
+	if v.Interface() != defaultValue {
+		return
+	}
+	if v.Kind() != v2.Kind() {
+		return
+	}
+	v.Set(v2)
+}
+
+// SetExcludeDefault 在目标值 value 不为默认值 defaultValue 时修改 variable 为 value
+func SetExcludeDefault(variable, value, defaultValue interface{}) {
+	v := reflect.ValueOf(variable)
+	v2 := reflect.ValueOf(value)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return
+	}
+	v = v.Elem()
+	if reflect.Indirect(v2).Interface() != defaultValue {
+		return
+	}
+	if v.Kind() != v2.Kind() {
+		return
+	}
+	v.Set(v2)
 }
 
 var (

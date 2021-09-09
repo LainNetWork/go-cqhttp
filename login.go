@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"io/ioutil"
 	"os"
 	"strings"
 	"time"
@@ -63,9 +62,13 @@ func qrcodeLogin() error {
 	if err != nil {
 		return err
 	}
-	_ = ioutil.WriteFile("qrcode.png", rsp.ImageData, 0o644)
+	_ = os.WriteFile("qrcode.png", rsp.ImageData, 0o644)
 	defer func() { _ = os.Remove("qrcode.png") }()
-	log.Infof("请使用手机QQ扫描二维码 (qrcode.png) : ")
+	if cli.Uin != 0 {
+		log.Infof("请使用账号 %v 登录手机QQ扫描二维码 (qrcode.png) : ", cli.Uin)
+	} else {
+		log.Infof("请使用手机QQ扫描二维码 (qrcode.png) : ")
+	}
 	time.Sleep(time.Second)
 	qrcodeTerminal.New().Get(fi.Content).Print()
 	s, err := cli.QueryQRCodeStatus(rsp.Sig)
@@ -83,21 +86,21 @@ func qrcodeLogin() error {
 			continue
 		}
 		prevState = s.State
-		if s.State == client.QRCodeCanceled {
+		switch s.State {
+		case client.QRCodeCanceled:
 			log.Fatalf("扫码被用户取消.")
-		}
-		if s.State == client.QRCodeTimeout {
+		case client.QRCodeTimeout:
 			log.Fatalf("二维码过期")
-		}
-		if s.State == client.QRCodeWaitingForConfirm {
+		case client.QRCodeWaitingForConfirm:
 			log.Infof("扫码成功, 请在手机端确认登录.")
-		}
-		if s.State == client.QRCodeConfirmed {
+		case client.QRCodeConfirmed:
 			res, err := cli.QRCodeLogin(s.LoginInfo)
 			if err != nil {
 				return err
 			}
 			return loginResponseProcessor(res)
+		case client.QRCodeImageFetch, client.QRCodeWaitingForScan:
+			// ignore
 		}
 	}
 }
@@ -114,25 +117,14 @@ func loginResponseProcessor(res *client.LoginResponse) error {
 		var text string
 		switch res.Error {
 		case client.SliderNeededError:
-			log.Warnf("登录需要滑条验证码. ")
-			log.Warnf("请参考文档 -> https://github.com/Mrs4s/go-cqhttp/blob/master/docs/slider.md <- 进行处理")
-			log.Warnf("1. 自行抓包并获取 Ticket 输入.")
-			log.Warnf("2. 使用手机QQ扫描二维码登入. (推荐)")
-			log.Warn("请输入(1 - 2) (将在10秒后自动选择2)：")
-			text = readLineTimeout(time.Second*10, "2")
-			if strings.Contains(text, "1") {
-				println()
-				log.Warnf("请用浏览器打开 -> %v <- 并获取Ticket.", res.VerifyUrl)
-				println()
-				log.Warn("请输入Ticket： (Enter 提交)")
-				text = readLine()
-				res, err = cli.SubmitTicket(text)
-				continue
-			}
+			log.Warnf("登录需要滑条验证码, 请使用手机QQ扫描二维码以继续登录.")
+			cli.Disconnect()
+			cli.Release()
+			cli = client.NewClientEmpty()
 			return qrcodeLogin()
 		case client.NeedCaptcha:
 			log.Warnf("登录需要验证码.")
-			_ = ioutil.WriteFile("captcha.jpg", res.CaptchaImage, 0o644)
+			_ = os.WriteFile("captcha.jpg", res.CaptchaImage, 0o644)
 			log.Warnf("请输入验证码 (captcha.jpg)： (Enter 提交)")
 			text = readLine()
 			global.DelFile("captcha.jpg")

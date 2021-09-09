@@ -2,7 +2,7 @@ package coolq
 
 import (
 	"encoding/hex"
-	"io/ioutil"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -24,18 +24,18 @@ func SetMessageFormat(f string) {
 }
 
 // ToFormattedMessage 将给定[]message.IMessageElement转换为通过coolq.SetMessageFormat所定义的消息上报格式
-func ToFormattedMessage(e []message.IMessageElement, id int64, isRaw ...bool) (r interface{}) {
+func ToFormattedMessage(e []message.IMessageElement, groupID int64, isRaw ...bool) (r interface{}) {
 	if format == "string" {
-		r = ToStringMessage(e, id, isRaw...)
+		r = ToStringMessage(e, groupID, isRaw...)
 	} else if format == "array" {
-		r = ToArrayMessage(e, id, isRaw...)
+		r = ToArrayMessage(e, groupID)
 	}
 	return
 }
 
 func (bot *CQBot) privateMessageEvent(c *client.QQClient, m *message.PrivateMessage) {
 	bot.checkMedia(m.Elements)
-	cqm := ToStringMessage(m.Elements, m.Sender.Uin, true)
+	cqm := ToStringMessage(m.Elements, 0, true)
 	if !m.Sender.IsFriend {
 		bot.oneWayMsgCache.Store(m.Sender.Uin, "")
 	}
@@ -45,13 +45,18 @@ func (bot *CQBot) privateMessageEvent(c *client.QQClient, m *message.PrivateMess
 	}
 	log.Infof("收到好友 %v(%v) 的消息: %v (%v)", m.Sender.DisplayName(), m.Sender.Uin, cqm, id)
 	fm := MSG{
-		"post_type":    "message",
+		"post_type": func() string {
+			if m.Sender.Uin == bot.Client.Uin {
+				return "message_sent"
+			}
+			return "message"
+		}(),
 		"message_type": "private",
 		"sub_type":     "friend",
 		"message_id":   id,
 		"user_id":      m.Sender.Uin,
 		"target_id":    m.Target,
-		"message":      ToFormattedMessage(m.Elements, m.Sender.Uin, false),
+		"message":      ToFormattedMessage(m.Elements, 0, false),
 		"raw_message":  cqm,
 		"font":         0,
 		"self_id":      c.Uin,
@@ -106,7 +111,7 @@ func (bot *CQBot) groupMessageEvent(c *client.QQClient, m *message.GroupMessage)
 func (bot *CQBot) tempMessageEvent(c *client.QQClient, e *client.TempMessageEvent) {
 	m := e.Message
 	bot.checkMedia(m.Elements)
-	cqm := ToStringMessage(m.Elements, m.Sender.Uin, true)
+	cqm := ToStringMessage(m.Elements, 0, true)
 	bot.tempSessionCache.Store(m.Sender.Uin, e.Session)
 	id := m.Id
 	if bot.db != nil {
@@ -120,7 +125,7 @@ func (bot *CQBot) tempMessageEvent(c *client.QQClient, e *client.TempMessageEven
 		"temp_source":  e.Session.Source,
 		"message_id":   id,
 		"user_id":      m.Sender.Uin,
-		"message":      ToFormattedMessage(m.Elements, m.Sender.Uin, false),
+		"message":      ToFormattedMessage(m.Elements, 0, false),
 		"raw_message":  cqm,
 		"font":         0,
 		"self_id":      c.Uin,
@@ -257,7 +262,11 @@ func (bot *CQBot) groupNotifyEvent(c *client.QQClient, e client.INotifyEvent) {
 func (bot *CQBot) friendNotifyEvent(c *client.QQClient, e client.INotifyEvent) {
 	friend := c.FindFriend(e.From())
 	if notify, ok := e.(*client.FriendPokeNotifyEvent); ok {
-		log.Infof("好友 %v 戳了戳你.", friend.Nickname)
+		if notify.Receiver == notify.Sender {
+			log.Infof("好友 %v 戳了戳自己.", friend.Nickname)
+		} else {
+			log.Infof("好友 %v 戳了戳你.", friend.Nickname)
+		}
 		bot.dispatchEventMessage(MSG{
 			"post_type":   "notice",
 			"notice_type": "notify",
@@ -269,6 +278,22 @@ func (bot *CQBot) friendNotifyEvent(c *client.QQClient, e client.INotifyEvent) {
 			"time":        time.Now().Unix(),
 		})
 	}
+}
+
+func (bot *CQBot) memberTitleUpdatedEvent(c *client.QQClient, e *client.MemberSpecialTitleUpdatedEvent) {
+	group := c.FindGroup(e.GroupCode)
+	mem := group.FindMember(e.Uin)
+	log.Infof("群 %v(%v) 内成员 %v(%v) 获得了新的头衔: %v", group.Name, group.Code, mem.DisplayName(), mem.Uin, e.NewTitle)
+	bot.dispatchEventMessage(MSG{
+		"post_type":   "notice",
+		"notice_type": "notify",
+		"sub_type":    "title",
+		"group_id":    group.Code,
+		"self_id":     c.Uin,
+		"user_id":     e.Uin,
+		"time":        time.Now().Unix(),
+		"title":       e.NewTitle,
+	})
 }
 
 func (bot *CQBot) friendRecallEvent(c *client.QQClient, e *client.FriendMessageRecalledEvent) {
@@ -531,59 +556,26 @@ func (bot *CQBot) groupDecrease(groupCode, userUin int64, operator *client.Group
 func (bot *CQBot) checkMedia(e []message.IMessageElement) {
 	for _, elem := range e {
 		switch i := elem.(type) {
-		case *message.ImageElement:
-			filename := hex.EncodeToString(i.Md5) + ".image"
-			if !global.PathExists(path.Join(global.ImagePath, filename)) {
-				_ = ioutil.WriteFile(path.Join(global.ImagePath, filename), binary.NewWriterF(func(w *binary.Writer) {
-					w.Write(i.Md5)
-					w.WriteUInt32(uint32(i.Size))
-					w.WriteString(i.Filename)
-					w.WriteString(i.Url)
-				}), 0o644)
-			}
-			i.Filename = filename
 		case *message.GroupImageElement:
 			filename := hex.EncodeToString(i.Md5) + ".image"
 			if !global.PathExists(path.Join(global.ImagePath, filename)) {
-				_ = ioutil.WriteFile(path.Join(global.ImagePath, filename), binary.NewWriterF(func(w *binary.Writer) {
+				_ = os.WriteFile(path.Join(global.ImagePath, filename), binary.NewWriterF(func(w *binary.Writer) {
 					w.Write(i.Md5)
 					w.WriteUInt32(uint32(i.Size))
-					w.WriteString(filename)
+					w.WriteString(i.ImageId)
 					w.WriteString(i.Url)
 				}), 0o644)
 			}
 		case *message.FriendImageElement:
 			filename := hex.EncodeToString(i.Md5) + ".image"
 			if !global.PathExists(path.Join(global.ImagePath, filename)) {
-				_ = ioutil.WriteFile(path.Join(global.ImagePath, filename), binary.NewWriterF(func(w *binary.Writer) {
+				_ = os.WriteFile(path.Join(global.ImagePath, filename), binary.NewWriterF(func(w *binary.Writer) {
 					w.Write(i.Md5)
-					w.WriteUInt32(uint32(0)) // 发送时会调用url, 大概没事
-					w.WriteString(filename)
+					w.WriteUInt32(uint32(i.Size))
+					w.WriteString(i.ImageId)
 					w.WriteString(i.Url)
 				}), 0o644)
 			}
-		case *message.GroupFlashImgElement:
-			filename := hex.EncodeToString(i.Md5) + ".image"
-			if !global.PathExists(path.Join(global.ImagePath, filename)) {
-				_ = ioutil.WriteFile(path.Join(global.ImagePath, filename), binary.NewWriterF(func(w *binary.Writer) {
-					w.Write(i.Md5)
-					w.WriteUInt32(uint32(i.Size))
-					w.WriteString(i.Filename)
-					w.WriteString("")
-				}), 0o644)
-			}
-			i.Filename = filename
-		case *message.FriendFlashImgElement:
-			filename := hex.EncodeToString(i.Md5) + ".image"
-			if !global.PathExists(path.Join(global.ImagePath, filename)) {
-				_ = ioutil.WriteFile(path.Join(global.ImagePath, filename), binary.NewWriterF(func(w *binary.Writer) {
-					w.Write(i.Md5)
-					w.WriteUInt32(uint32(i.Size))
-					w.WriteString(i.Filename)
-					w.WriteString("")
-				}), 0o644)
-			}
-			i.Filename = filename
 		case *message.VoiceElement:
 			i.Name = strings.ReplaceAll(i.Name, "{", "")
 			i.Name = strings.ReplaceAll(i.Name, "}", "")
@@ -593,12 +585,12 @@ func (bot *CQBot) checkMedia(e []message.IMessageElement) {
 					log.Warnf("语音文件 %v 下载失败: %v", i.Name, err)
 					continue
 				}
-				_ = ioutil.WriteFile(path.Join(global.VoicePath, i.Name), b, 0o644)
+				_ = os.WriteFile(path.Join(global.VoicePath, i.Name), b, 0o644)
 			}
 		case *message.ShortVideoElement:
 			filename := hex.EncodeToString(i.Md5) + ".video"
 			if !global.PathExists(path.Join(global.VideoPath, filename)) {
-				_ = ioutil.WriteFile(path.Join(global.VideoPath, filename), binary.NewWriterF(func(w *binary.Writer) {
+				_ = os.WriteFile(path.Join(global.VideoPath, filename), binary.NewWriterF(func(w *binary.Writer) {
 					w.Write(i.Md5)
 					w.Write(i.ThumbMd5)
 					w.WriteUInt32(uint32(i.Size))
